@@ -3,11 +3,7 @@ setlocal
 
 cd /d "%~dp0"
 
-echo [1/2] Installing build dependencies...
-python -m pip install --upgrade pip >nul
-python -m pip install -r requirements.txt pyinstaller
-
-echo [2/2] Building UEVersionDetector executable...
+echo Building UEVersionDetector executable...
 if exist "icon.png" (
     pyinstaller UEVersionDetector.spec
 ) else (
