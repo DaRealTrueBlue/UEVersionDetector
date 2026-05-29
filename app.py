@@ -4,8 +4,14 @@ import json
 import os
 import queue
 import re
+import subprocess
+import sys
+import tempfile
 import threading
 import tkinter as tk
+import urllib.error
+import urllib.request
+import webbrowser
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -32,6 +38,11 @@ except ImportError:
 
 
 BUILD_VERSION_RELATIVE_PATH = Path("Engine") / "Build" / "Build.version"
+APP_VERSION = "1.0.0"
+GITHUB_REPOSITORY = "DaRealTrueBlue/UEVersionDetector"
+GITHUB_RELEASES_LATEST_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
+GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPOSITORY}/releases"
+UPDATE_TIMEOUT_SECONDS = 20
 UNREAL_RELEASE_REGEX = re.compile(rb"\+\+UE(?P<major>[45])\+Release-(?P<release>\d+(?:\.\d+){0,2})")
 UNREAL_TEXT_REGEX = re.compile(rb"Unreal Engine\s*(?P<major>[45])\.(?P<minor>\d+)(?:\.(?P<patch>\d+))?", re.IGNORECASE)
 UNREAL_SHORT_REGEX = re.compile(rb"UE(?P<major>[45])(?:[\._\-])(?P<minor>\d+)(?:[\._\-](?P<patch>\d+))?")
@@ -56,6 +67,131 @@ class DetectionResult:
     confidence: str
     source: str
     details: str
+
+
+@dataclass
+class ReleaseInfo:
+    version: str
+    tag_name: str
+    name: str
+    html_url: str
+    asset_name: Optional[str]
+    asset_url: Optional[str]
+
+
+def normalize_version_text(version_text: str) -> str:
+    normalized = version_text.strip()
+    if normalized.lower().startswith("v"):
+        normalized = normalized[1:]
+    match = re.search(r"\d+(?:\.\d+){0,3}", normalized)
+    return match.group(0) if match else "0.0.0"
+
+
+def version_key(version_text: str) -> tuple[int, ...]:
+    normalized = normalize_version_text(version_text)
+    values: list[int] = []
+    for token in normalized.split("."):
+        try:
+            values.append(int(token))
+        except ValueError:
+            values.append(0)
+    while len(values) < 4:
+        values.append(0)
+    return tuple(values)
+
+
+def is_newer_version(candidate: str, baseline: str) -> bool:
+    return version_key(candidate) > version_key(baseline)
+
+
+def pick_release_asset(assets: list[dict]) -> tuple[Optional[str], Optional[str]]:
+    if not assets:
+        return None, None
+
+    preferred = [
+        asset
+        for asset in assets
+        if str(asset.get("name", "")).lower().endswith(".exe")
+        and "ueversiondetector" in str(asset.get("name", "")).lower()
+    ]
+    generic_exe = [asset for asset in assets if str(asset.get("name", "")).lower().endswith(".exe")]
+    selection = preferred[0] if preferred else (generic_exe[0] if generic_exe else assets[0])
+    return selection.get("name"), selection.get("browser_download_url")
+
+
+def fetch_latest_github_release() -> Optional[ReleaseInfo]:
+    request = urllib.request.Request(
+        GITHUB_RELEASES_LATEST_API,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "UEVersionDetector-Updater",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=UPDATE_TIMEOUT_SECONDS) as response:
+        payload = json.loads(response.read().decode("utf-8", errors="replace"))
+
+    tag_name = str(payload.get("tag_name") or "")
+    name = str(payload.get("name") or tag_name or "Latest release")
+    html_url = str(payload.get("html_url") or GITHUB_RELEASES_PAGE)
+    version = normalize_version_text(tag_name or name)
+    asset_name, asset_url = pick_release_asset(payload.get("assets") or [])
+
+    return ReleaseInfo(
+        version=version,
+        tag_name=tag_name,
+        name=name,
+        html_url=html_url,
+        asset_name=asset_name,
+        asset_url=asset_url,
+    )
+
+
+def download_release_asset(url: str, destination: Path, progress: Optional[Callable[[str], None]] = None) -> None:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/octet-stream",
+            "User-Agent": "UEVersionDetector-Updater",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=UPDATE_TIMEOUT_SECONDS) as response:
+        total = int(response.headers.get("Content-Length", "0") or "0")
+        downloaded = 0
+        with destination.open("wb") as file_handle:
+            while True:
+                chunk = response.read(256 * 1024)
+                if not chunk:
+                    break
+                file_handle.write(chunk)
+                downloaded += len(chunk)
+                if progress and total > 0:
+                    percent = min(int((downloaded / total) * 100), 100)
+                    progress(f"Downloading update... {percent}%")
+
+
+def create_self_replace_script(pid: int, current_exe: Path, downloaded_exe: Path) -> Path:
+    script_path = Path(tempfile.gettempdir()) / f"ueversiondetector_update_{pid}.bat"
+    script_body = f"""@echo off
+setlocal
+set "TARGET_EXE={current_exe}"
+set "DOWNLOAD_EXE={downloaded_exe}"
+set "WAIT_PID={pid}"
+
+:wait_process
+tasklist /FI "PID eq %WAIT_PID%" 2>NUL | find "%WAIT_PID%" >NUL
+if not errorlevel 1 (
+    timeout /t 1 /nobreak >NUL
+    goto wait_process
+)
+
+copy /Y "%DOWNLOAD_EXE%" "%TARGET_EXE%" >NUL
+start "" "%TARGET_EXE%"
+del "%DOWNLOAD_EXE%" >NUL 2>&1
+del "%~f0"
+endlocal
+"""
+    script_path.write_text(script_body, encoding="utf-8")
+    return script_path
 
 
 class UnrealVersionDetector:
@@ -428,6 +564,9 @@ class UnrealVersionDetectorApp:
         self.task_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.worker_thread: Optional[threading.Thread] = None
         self.scan_running = False
+        self.update_check_running = False
+        self.update_download_running = False
+        self.latest_release: Optional[ReleaseInfo] = None
 
         self.selected_folder = tk.StringVar()
         self.scan_mode = tk.StringVar(value="folder")
@@ -479,12 +618,14 @@ class UnrealVersionDetectorApp:
         self.folder_browse_button: Optional[ttk.Button] = None
         self.process_scan_button: Optional[ttk.Button] = None
         self.process_refresh_button: Optional[ttk.Button] = None
+        self.update_button: Optional[ttk.Button] = None
 
         self._set_window_icon()
         self._configure_style()
         self._build_ui()
         self.refresh_processes()
         self.root.after(120, self._poll_queue)
+        self.root.after(1400, lambda: self.check_for_updates(user_initiated=False))
 
     def _set_window_icon(self) -> None:
         if not Image or not ImageTk:
@@ -540,12 +681,18 @@ class UnrealVersionDetectorApp:
 
         header = ttk.Frame(root_frame, style="App.TFrame")
         header.grid(row=0, column=0, sticky="ew", pady=(0, 12))
-        ttk.Label(header, text="Unreal Engine Version Detector", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(
+        header.columnconfigure(0, weight=1)
+
+        self.update_button = ttk.Button(
             header,
-            text="Detect UE versions from folders or live processes with confidence and traceable scan output.",
-            style="Subtitle.TLabel",
-        ).pack(anchor="w", pady=(2, 0))
+            text="Check for Updates",
+            style="Export.TButton",
+            command=lambda: self.check_for_updates(user_initiated=True),
+        )
+        self.update_button.pack(side="right", padx=(8, 0))
+
+        ttk.Label(header, text="Unreal Engine Version Detector", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(header, text=f"Version {APP_VERSION}", style="Subtitle.TLabel").pack(anchor="w", pady=(1, 0))
 
         body = ttk.Frame(root_frame, style="App.TFrame")
         body.grid(row=1, column=0, sticky="nsew")
@@ -900,6 +1047,111 @@ class UnrealVersionDetectorApp:
             else:
                 self.progress.stop()
 
+    def check_for_updates(self, user_initiated: bool) -> None:
+        if self.update_check_running or self.update_download_running:
+            if user_initiated:
+                self.status_text.set("Update check already running")
+            return
+
+        self.update_check_running = True
+        if self.update_button:
+            self.update_button.configure(state="disabled")
+        self._log("Checking GitHub for updates...")
+        if user_initiated:
+            self.status_text.set("Checking for updates...")
+
+        def worker() -> None:
+            try:
+                release = fetch_latest_github_release()
+                self.task_queue.put(("update-check-complete", (release, user_initiated)))
+            except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, TimeoutError, OSError) as error:
+                self.task_queue.put(("update-check-error", (str(error), user_initiated)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _handle_update_check_result(self, release: Optional[ReleaseInfo], user_initiated: bool) -> None:
+        self.update_check_running = False
+        if self.update_button and not self.update_download_running:
+            self.update_button.configure(state="normal")
+
+        if not release:
+            if user_initiated:
+                messagebox.showinfo("Update check", "Could not fetch release information from GitHub.")
+            return
+
+        self.latest_release = release
+        if is_newer_version(release.version, APP_VERSION):
+            self._log(f"Update available: {release.version} (current {APP_VERSION})")
+            self.status_text.set(f"Update available: {release.version}")
+            should_install = messagebox.askyesno(
+                "Update available",
+                f"Version {release.version} is available on GitHub.\n"
+                f"You are currently on {APP_VERSION}.\n\n"
+                "Download and install now?",
+            )
+            if should_install:
+                self._download_and_install_update(release)
+        else:
+            self._log("Application is up to date.")
+            self.status_text.set("App is up to date")
+            if user_initiated:
+                messagebox.showinfo("Update check", f"You're up to date (v{APP_VERSION}).")
+
+    def _download_and_install_update(self, release: ReleaseInfo) -> None:
+        if self.update_download_running:
+            return
+
+        if not release.asset_url:
+            self._log("No downloadable release asset found, opening releases page.")
+            self.status_text.set("No release asset found")
+            webbrowser.open(release.html_url or GITHUB_RELEASES_PAGE)
+            return
+
+        self.update_download_running = True
+        if self.update_button:
+            self.update_button.configure(state="disabled")
+        self.status_text.set("Downloading update...")
+
+        def worker() -> None:
+            try:
+                asset_name = release.asset_name or "UEVersionDetector_update.exe"
+                destination = Path(tempfile.gettempdir()) / asset_name
+                download_release_asset(
+                    release.asset_url,
+                    destination,
+                    progress=lambda text: self.task_queue.put(("update-download-progress", text)),
+                )
+                self.task_queue.put(("update-download-complete", (destination, release)))
+            except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError) as error:
+                self.task_queue.put(("update-download-error", str(error)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _install_downloaded_update(self, downloaded_exe: Path, release: ReleaseInfo) -> None:
+        self.update_download_running = False
+
+        if not getattr(sys, "frozen", False):
+            self._log("Downloaded update in source mode; opening release page for manual install.")
+            self.status_text.set("Update downloaded (manual install)")
+            messagebox.showinfo(
+                "Update downloaded",
+                f"Downloaded {downloaded_exe.name}.\n\n"
+                "You're running from source, so automatic replace is disabled.\n"
+                "The GitHub releases page will open for manual update steps.",
+            )
+            webbrowser.open(release.html_url or GITHUB_RELEASES_PAGE)
+            if self.update_button:
+                self.update_button.configure(state="normal")
+            return
+
+        current_exe = Path(sys.executable)
+        updater_script = create_self_replace_script(os.getpid(), current_exe, downloaded_exe)
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        subprocess.Popen(["cmd", "/c", str(updater_script)], creationflags=creationflags)
+        self.status_text.set("Installing update and restarting...")
+        self._log("Update installer started. Application will close to complete install.")
+        self.root.after(250, self.root.destroy)
+
     def _start_scan_task(self, mode: str, value: str | int) -> None:
         if self.scan_running:
             return
@@ -953,6 +1205,32 @@ class UnrealVersionDetectorApp:
                     self._log(f"Scan failed: {payload}")
                     self._set_running_state(False, "Scan failed")
                     messagebox.showerror("Scan failed", str(payload))
+                elif event == "update-check-complete":
+                    release, user_initiated = payload if isinstance(payload, tuple) else (None, False)
+                    self._handle_update_check_result(release, bool(user_initiated))
+                elif event == "update-check-error":
+                    error_text, user_initiated = payload if isinstance(payload, tuple) else (str(payload), False)
+                    self.update_check_running = False
+                    if not self.update_download_running and self.update_button:
+                        self.update_button.configure(state="normal")
+                    self._log(f"Update check failed: {error_text}")
+                    if user_initiated:
+                        self.status_text.set("Update check failed")
+                        messagebox.showerror("Update check failed", str(error_text))
+                elif event == "update-download-progress":
+                    self.status_text.set(str(payload))
+                elif event == "update-download-complete":
+                    destination, release = payload if isinstance(payload, tuple) else (None, None)
+                    if isinstance(destination, Path) and isinstance(release, ReleaseInfo):
+                        self._log(f"Update downloaded: {destination}")
+                        self._install_downloaded_update(destination, release)
+                elif event == "update-download-error":
+                    self.update_download_running = False
+                    if self.update_button:
+                        self.update_button.configure(state="normal")
+                    self._log(f"Update download failed: {payload}")
+                    self.status_text.set("Update download failed")
+                    messagebox.showerror("Update download failed", str(payload))
         except queue.Empty:
             pass
 
