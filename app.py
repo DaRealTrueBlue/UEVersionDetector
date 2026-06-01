@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tkinter as tk
 import urllib.error
 import urllib.request
@@ -38,7 +39,7 @@ except ImportError:
 
 
 BUILD_VERSION_RELATIVE_PATH = Path("Engine") / "Build" / "Build.version"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 GITHUB_REPOSITORY = "DaRealTrueBlue/UEVersionDetector"
 GITHUB_RELEASES_LATEST_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPOSITORY}/releases"
@@ -59,6 +60,7 @@ UNREAL_MAJOR_ONLY_REGEXES = (
 )
 
 ProgressCallback = Optional[Callable[[str], None]]
+CancelCallback = Optional[Callable[[], bool]]
 
 
 @dataclass
@@ -204,7 +206,7 @@ class UnrealVersionDetector:
     @staticmethod
     def parse_build_version(build_version_file: Path) -> Optional[DetectionResult]:
         try:
-            data = json.loads(build_version_file.read_text(encoding="utf-8"))
+            data = json.loads(build_version_file.read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             return None
 
@@ -224,7 +226,7 @@ class UnrealVersionDetector:
     @staticmethod
     def parse_uproject(uproject_file: Path) -> Optional[DetectionResult]:
         try:
-            data = json.loads(uproject_file.read_text(encoding="utf-8"))
+            data = json.loads(uproject_file.read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             return None
 
@@ -309,7 +311,14 @@ class UnrealVersionDetector:
         return "low"
 
     @staticmethod
-    def sniff_binary_for_unreal_version(binary_file: Path, progress: ProgressCallback = None) -> Optional[DetectionResult]:
+    def sniff_binary_for_unreal_version(
+        binary_file: Path,
+        progress: ProgressCallback = None,
+        should_cancel: CancelCallback = None,
+    ) -> Optional[DetectionResult]:
+        if should_cancel and should_cancel():
+            return None
+
         if progress:
             progress(f"Scanning binary: {binary_file.name}")
 
@@ -414,9 +423,20 @@ class UnrealVersionDetector:
             return []
 
         candidates: list[Path] = []
+        seen_candidates: set[str] = set()
+
+        def add_candidate(path: Path) -> None:
+            normalized = str(path.resolve()).lower()
+            if normalized in seen_candidates:
+                return
+            seen_candidates.add(normalized)
+            candidates.append(path)
+
         if search_root.name.lower() == "win64":
-            candidates.extend(sorted(search_root.glob("*.exe")))
-            candidates.extend(sorted(search_root.glob("*.dll")))
+            for path in sorted(search_root.glob("*.exe")):
+                add_candidate(path)
+            for path in sorted(search_root.glob("*.dll")):
+                add_candidate(path)
             return candidates[:120]
 
         common_dirs = [
@@ -428,18 +448,21 @@ class UnrealVersionDetector:
 
         for directory in common_dirs:
             if directory.exists() and directory.is_dir():
-                candidates.extend(sorted(directory.glob("*.exe")))
-                candidates.extend(sorted(directory.glob("*.dll")))
+                for path in sorted(directory.glob("*.exe")):
+                    add_candidate(path)
+                for path in sorted(directory.glob("*.dll")):
+                    add_candidate(path)
 
         if candidates:
             return candidates[:120]
 
         unreal_named: list[Path] = []
         generic: list[Path] = []
-        for root, _, files in os.walk(search_root):
+        for root, dirs, files in os.walk(search_root):
             root_path = Path(root)
             depth = len(root_path.parts) - len(search_root.parts)
             if depth > 6:
+                dirs[:] = []
                 continue
 
             for file_name in files:
@@ -456,13 +479,23 @@ class UnrealVersionDetector:
                 if len(unreal_named) >= 50 and len(generic) >= 80:
                     break
 
+            if len(unreal_named) >= 50 and len(generic) >= 80:
+                break
+
         return (unreal_named + generic)[:120]
 
     @staticmethod
-    def detect_from_folder(folder_path: str, progress: ProgressCallback = None) -> DetectionResult:
+    def detect_from_folder(
+        folder_path: str,
+        progress: ProgressCallback = None,
+        should_cancel: CancelCallback = None,
+    ) -> DetectionResult:
         root = Path(folder_path)
         if progress:
             progress(f"Analyzing folder: {root}")
+
+        if should_cancel and should_cancel():
+            return DetectionResult(None, "none", folder_path, "Scan cancelled by user")
 
         if not root.exists() or not root.is_dir():
             return DetectionResult(None, "none", folder_path, "Folder does not exist or is not a directory")
@@ -476,6 +509,8 @@ class UnrealVersionDetector:
         if progress:
             progress("Checking .uproject EngineAssociation...")
         for project_file in root.glob("*.uproject"):
+            if should_cancel and should_cancel():
+                return DetectionResult(None, "none", folder_path, "Scan cancelled by user")
             project_result = UnrealVersionDetector.parse_uproject(project_file)
             if project_result:
                 return project_result
@@ -487,16 +522,30 @@ class UnrealVersionDetector:
             progress(f"Binary candidates discovered: {len(candidates)}")
 
         for index, binary_path in enumerate(candidates, start=1):
-            result = UnrealVersionDetector.sniff_binary_for_unreal_version(binary_path, progress if index <= 20 else None)
+            if should_cancel and should_cancel():
+                return DetectionResult(None, "none", folder_path, "Scan cancelled by user")
+
+            result = UnrealVersionDetector.sniff_binary_for_unreal_version(
+                binary_path,
+                progress if index <= 20 else None,
+                should_cancel=should_cancel,
+            )
             if result:
                 return result
 
         return DetectionResult(None, "none", folder_path, "No Unreal Engine version signature found")
 
     @staticmethod
-    def detect_from_process(pid: int, progress: ProgressCallback = None) -> DetectionResult:
+    def detect_from_process(
+        pid: int,
+        progress: ProgressCallback = None,
+        should_cancel: CancelCallback = None,
+    ) -> DetectionResult:
         if psutil is None:
             return DetectionResult(None, "none", str(pid), "psutil is not installed; process detection unavailable")
+
+        if should_cancel and should_cancel():
+            return DetectionResult(None, "none", str(pid), "Scan cancelled by user")
 
         try:
             process = psutil.Process(pid)
@@ -506,7 +555,11 @@ class UnrealVersionDetector:
 
         if progress:
             progress(f"Scanning main executable: {exe_path.name}")
-        direct_result = UnrealVersionDetector.sniff_binary_for_unreal_version(exe_path, progress)
+        direct_result = UnrealVersionDetector.sniff_binary_for_unreal_version(
+            exe_path,
+            progress,
+            should_cancel=should_cancel,
+        )
         if direct_result:
             return direct_result
 
@@ -534,7 +587,14 @@ class UnrealVersionDetector:
             progress(f"Scanning loaded modules: {len(prioritized_modules)}")
 
         for index, module_path in enumerate(prioritized_modules, start=1):
-            module_result = UnrealVersionDetector.sniff_binary_for_unreal_version(module_path, progress if index <= 30 else None)
+            if should_cancel and should_cancel():
+                return DetectionResult(None, "none", str(pid), "Scan cancelled by user")
+
+            module_result = UnrealVersionDetector.sniff_binary_for_unreal_version(
+                module_path,
+                progress if index <= 30 else None,
+                should_cancel=should_cancel,
+            )
             if module_result:
                 module_result.details = f"Detected from loaded process module: {module_result.details}"
                 return module_result
@@ -547,7 +607,14 @@ class UnrealVersionDetector:
         if progress:
             progress("Falling back to nearby folder scan...")
         for root in search_roots:
-            folder_result = UnrealVersionDetector.detect_from_folder(str(root), progress)
+            if should_cancel and should_cancel():
+                return DetectionResult(None, "none", str(pid), "Scan cancelled by user")
+
+            folder_result = UnrealVersionDetector.detect_from_folder(
+                str(root),
+                progress,
+                should_cancel=should_cancel,
+            )
             if folder_result.version:
                 return folder_result
 
@@ -557,7 +624,7 @@ class UnrealVersionDetector:
 class UnrealVersionDetectorApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("Unreal Engine Version Detector")
+        self.root.title(f"Unreal Engine Version Detector | v{APP_VERSION}")
         self.root.geometry("1180x760")
         self.root.minsize(860, 560)
 
@@ -567,6 +634,10 @@ class UnrealVersionDetectorApp:
         self.update_check_running = False
         self.update_download_running = False
         self.latest_release: Optional[ReleaseInfo] = None
+        self.icon_photo: Optional[object] = None
+        self.scan_cancel_event = threading.Event()
+        self.scan_cache: dict[str, tuple[DetectionResult, float]] = {}
+        self.scan_cache_ttl_seconds = 300.0
 
         self.selected_folder = tk.StringVar()
         self.scan_mode = tk.StringVar(value="folder")
@@ -618,6 +689,7 @@ class UnrealVersionDetectorApp:
         self.folder_browse_button: Optional[ttk.Button] = None
         self.process_scan_button: Optional[ttk.Button] = None
         self.process_refresh_button: Optional[ttk.Button] = None
+        self.cancel_scan_button: Optional[ttk.Button] = None
         self.update_button: Optional[ttk.Button] = None
 
         self._set_window_icon()
@@ -637,8 +709,8 @@ class UnrealVersionDetectorApp:
 
         try:
             icon = Image.open(icon_path)
-            photo = ImageTk.PhotoImage(icon)
-            self.root.iconphoto(True, photo)
+            self.icon_photo = ImageTk.PhotoImage(icon)
+            self.root.iconphoto(True, self.icon_photo)
         except Exception:
             return
 
@@ -692,7 +764,6 @@ class UnrealVersionDetectorApp:
         self.update_button.pack(side="right", padx=(8, 0))
 
         ttk.Label(header, text="Unreal Engine Version Detector", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(header, text=f"Version {APP_VERSION}", style="Subtitle.TLabel").pack(anchor="w", pady=(1, 0))
 
         body = ttk.Frame(root_frame, style="App.TFrame")
         body.grid(row=1, column=0, sticky="nsew")
@@ -886,8 +957,20 @@ class UnrealVersionDetectorApp:
 
         log_frame = ttk.LabelFrame(right, text="Live Console", style="Panel.TLabelframe", padding=10)
         log_frame.pack(fill="both", expand=True)
-        self.progress = ttk.Progressbar(log_frame, mode="indeterminate")
-        self.progress.pack(fill="x", pady=(0, 8))
+
+        progress_row = ttk.Frame(log_frame, style="Panel.TFrame")
+        progress_row.pack(fill="x", pady=(0, 8))
+        self.progress = ttk.Progressbar(progress_row, mode="indeterminate")
+        self.progress.pack(side="left", fill="x", expand=True)
+        self.cancel_scan_button = ttk.Button(
+            progress_row,
+            text="Cancel Scan",
+            width=12,
+            command=self._cancel_scan_clicked,
+            state="disabled",
+        )
+        self.cancel_scan_button.pack(side="right", padx=(8, 0))
+
         self.log_widget = scrolledtext.ScrolledText(
             log_frame,
             wrap="word",
@@ -905,7 +988,7 @@ class UnrealVersionDetectorApp:
         status_bar = ttk.Frame(root_frame, style="App.TFrame")
         status_bar.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         ttk.Label(status_bar, textvariable=self.status_text, style="Status.TLabel").pack(side="left")
-        ttk.Label(status_bar, text="Made by DaRealTrueBlue", style="Subtitle.TLabel").pack(side="right")
+        ttk.Label(status_bar, text=f"Made by DaRealTrueBlue | v{APP_VERSION}", style="Subtitle.TLabel").pack(side="right")
 
     def _log(self, message: str) -> None:
         if not self.log_widget:
@@ -1041,6 +1124,9 @@ class UnrealVersionDetectorApp:
         if self.process_listbox:
             self.process_listbox.configure(state=state)
 
+        if self.cancel_scan_button:
+            self.cancel_scan_button.configure(state="normal" if running else "disabled")
+
         if self.progress:
             if running:
                 self.progress.start(10)
@@ -1156,7 +1242,21 @@ class UnrealVersionDetectorApp:
         if self.scan_running:
             return
 
+        cache_key = self._build_scan_cache_key(mode, value)
+        cached = self._cache_get(cache_key)
+        if cached:
+            self.last_result = cached
+            self.version_text.set(cached.version or "Not detected")
+            self.confidence_text.set(cached.confidence)
+            self.source_text.set(cached.source)
+            self._set_badge(cached.confidence)
+            self._set_details(cached.details)
+            self._log("Loaded result from cache.")
+            self.status_text.set("Scan complete (cached)")
+            return
+
         self._reset_result()
+        self.scan_cancel_event.clear()
         if self.log_widget:
             self.log_widget.configure(state="normal")
             self.log_widget.delete("1.0", tk.END)
@@ -1171,13 +1271,15 @@ class UnrealVersionDetectorApp:
                     result = UnrealVersionDetector.detect_from_folder(
                         str(value),
                         progress=lambda msg: self.task_queue.put(("progress", msg)),
+                        should_cancel=self.scan_cancel_event.is_set,
                     )
                 else:
                     result = UnrealVersionDetector.detect_from_process(
                         int(value),
                         progress=lambda msg: self.task_queue.put(("progress", msg)),
+                        should_cancel=self.scan_cancel_event.is_set,
                     )
-                self.task_queue.put(("complete", result))
+                self.task_queue.put(("complete", (result, cache_key)))
             except Exception as error:
                 self.task_queue.put(("error", str(error)))
 
@@ -1191,7 +1293,7 @@ class UnrealVersionDetectorApp:
                 if event == "progress":
                     self._log(str(payload))
                 elif event == "complete":
-                    result = payload
+                    result, cache_key = payload if isinstance(payload, tuple) else (payload, None)
                     if isinstance(result, DetectionResult):
                         self.last_result = result
                         self.version_text.set(result.version or "Not detected")
@@ -1199,8 +1301,11 @@ class UnrealVersionDetectorApp:
                         self.source_text.set(result.source)
                         self._set_badge(result.confidence)
                         self._set_details(result.details)
-                        self._log("Scan complete.")
-                        self._set_running_state(False, "Scan complete")
+                        is_cancelled = result.details == "Scan cancelled by user"
+                        if not is_cancelled and isinstance(cache_key, str):
+                            self._cache_set(cache_key, result)
+                        self._log("Scan cancelled." if is_cancelled else "Scan complete.")
+                        self._set_running_state(False, "Scan cancelled" if is_cancelled else "Scan complete")
                 elif event == "error":
                     self._log(f"Scan failed: {payload}")
                     self._set_running_state(False, "Scan failed")
@@ -1276,17 +1381,92 @@ class UnrealVersionDetectorApp:
 
         self._start_scan_task("process", pid)
 
+    def _cancel_scan_clicked(self) -> None:
+        if not self.scan_running:
+            return
+
+        self.scan_cancel_event.set()
+        self.status_text.set("Cancelling scan...")
+        self._log("Cancellation requested.")
+
+    def _cache_get(self, key: str) -> Optional[DetectionResult]:
+        entry = self.scan_cache.get(key)
+        if not entry:
+            return None
+
+        result, timestamp = entry
+        if (time.monotonic() - timestamp) > self.scan_cache_ttl_seconds:
+            self.scan_cache.pop(key, None)
+            return None
+
+        return result
+
+    def _cache_set(self, key: str, result: DetectionResult) -> None:
+        self.scan_cache[key] = (result, time.monotonic())
+
+    def _build_scan_cache_key(self, mode: str, value: str | int) -> str:
+        if mode == "folder":
+            folder = Path(str(value)).resolve()
+            return f"folder:{str(folder).lower()}|sig:{self._folder_cache_signature(folder)}"
+
+        pid = int(value)
+        return self._process_cache_signature(pid)
+
+    def _folder_cache_signature(self, folder: Path) -> str:
+        build_file = folder / BUILD_VERSION_RELATIVE_PATH
+        uproject_files = sorted(folder.glob("*.uproject"))
+
+        parts = ["none"]
+        if build_file.exists():
+            try:
+                stat = build_file.stat()
+                parts.append(f"build:{stat.st_size}:{stat.st_mtime_ns}")
+            except OSError:
+                parts.append("build:unreadable")
+        else:
+            parts.append("build:missing")
+
+        if uproject_files:
+            for project in uproject_files[:6]:
+                try:
+                    stat = project.stat()
+                    parts.append(f"uproject:{project.name.lower()}:{stat.st_size}:{stat.st_mtime_ns}")
+                except OSError:
+                    parts.append(f"uproject:{project.name.lower()}:unreadable")
+        else:
+            parts.append("uproject:none")
+
+        return "|".join(parts)
+
+    def _process_cache_signature(self, pid: int) -> str:
+        if psutil is None:
+            return f"process:{pid}"
+
+        try:
+            process = psutil.Process(pid)
+            exe = Path(process.exe())
+            stat = exe.stat()
+            return f"process:{str(exe).lower()}:{stat.st_size}:{stat.st_mtime_ns}"
+        except Exception:
+            return f"process:{pid}"
+
     def _collect_processes(self) -> list[tuple[str, int]]:
         if psutil is None:
             return []
 
         window_pids: set[int] = set()
+        window_titles_by_pid: dict[int, str] = {}
         if win32gui and win32process:
             def enum_window_callback(hwnd: int, _param: int) -> bool:
                 if win32gui.IsWindowVisible(hwnd):
                     try:
                         _, pid = win32process.GetWindowThreadProcessId(hwnd)
                         window_pids.add(pid)
+                        title = str(win32gui.GetWindowText(hwnd) or "").strip()
+                        if title and title not in ("Program Manager",):
+                            previous = window_titles_by_pid.get(pid)
+                            if not previous or len(title) > len(previous):
+                                window_titles_by_pid[pid] = title
                     except Exception:
                         return True
                 return True
@@ -1296,7 +1476,7 @@ class UnrealVersionDetectorApp:
             except Exception:
                 pass
 
-        entries: list[tuple[str, int]] = []
+        scored_entries: list[tuple[int, str, int]] = []
         for process in psutil.process_iter(attrs=["pid", "name", "exe"]):
             pid = process.info.get("pid")
             name = process.info.get("name") or "<unknown>"
@@ -1308,10 +1488,27 @@ class UnrealVersionDetectorApp:
             if window_pids and int(pid) not in window_pids:
                 continue
 
-            entries.append((f"{name} (PID {pid})", int(pid)))
+            exe_name = Path(str(exe)).name
+            lower_blob = f"{name} {exe_name}".lower()
+            score = 0
+            if int(pid) in window_pids:
+                score += 3
+            if any(token in lower_blob for token in ("shipping", "game", "client", "win64", "unreal", "ue4", "ue5")):
+                score += 4
+            if any(token in lower_blob for token in ("steam", "epicgameslauncher", "explorer", "chrome", "msedge", "firefox")):
+                score -= 3
 
-        entries.sort(key=lambda item: item[0].lower())
-        return entries
+            title = window_titles_by_pid.get(int(pid), "")
+            if title:
+                score += 1
+                display = f"{name} (PID {pid}) - {title}"
+            else:
+                display = f"{name} (PID {pid})"
+
+            scored_entries.append((score, display, int(pid)))
+
+        scored_entries.sort(key=lambda item: (-item[0], item[1].lower()))
+        return [(display, pid) for _, display, pid in scored_entries[:300]]
 
     def _filter_processes(self) -> None:
         if not self.process_listbox:
